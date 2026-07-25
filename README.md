@@ -12,17 +12,36 @@ moved on without you.
 cargo run --release
 ```
 
+**drag** the map to pan &nbsp;·&nbsp; **wheel** to zoom &nbsp;·&nbsp; arrow keys also pan
+
 `esc` settings &nbsp;·&nbsp; `space` pause &nbsp;·&nbsp; `+` / `-` speed &nbsp;·&nbsp; `q` quit
 
 `--fresh` new world &nbsp;·&nbsp; `--shot out.bmp` save a picture &nbsp;·&nbsp; `--speed 60` &nbsp;·&nbsp; `--scale 2` &nbsp;·&nbsp; `--borderless` &nbsp;·&nbsp; `--topmost`
 
+With no title bar, drag anywhere *outside* the map — the side panel or the chronicle
+strip — to carry the window around, since there is no bar to grab.
+
 ## settings
 
-`esc` opens a settings screen: speed, window size, title bar, always-on-top. Arrow keys
-change things, closing it writes `civ.cfg` next to the executable, which you can also
-edit by hand. The window is never opened larger than your screen — an oversized
-always-on-top window with no title bar has no close button and no edges to drag, and
-just eats the desktop.
+`esc` opens a settings screen: speed, window size, title bar, always-on-top. Click the
+arrows or use the arrow keys; closing it writes `civ.cfg` next to the executable, which
+you can also edit by hand.
+
+The window is never opened larger than your screen — an oversized always-on-top window
+with no title bar has no close button and no edges to drag, and just eats the desktop.
+Drag-resizing is deliberately off: minifb scales mouse positions by the integer scale
+factor only, so a resized window puts every click in the wrong place.
+
+## speed
+
+Measured, not guessed: a simulated year costs **10 µs**, a full redraw **277 µs** — 1.7%
+of one 60fps frame, for a picture that changes five times a second. Sitting there
+watching costs **0.4% of one core** and 12 MB.
+
+The one thing that was actually wasteful: the loop used to push the whole 2.4 MB
+framebuffer to the window every 8 ms whether or not anything had changed, which cost
+**3.9% of a core** to display a mostly static image. It now only blits after something
+is redrawn and otherwise just pumps input.
 
 ## how the idle part works
 

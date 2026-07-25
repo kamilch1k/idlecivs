@@ -3,12 +3,16 @@
 // ponytail: the save file is "<seed> <year>" - the sim is deterministic, so resuming
 // is just a replay and there is no serializer. Time away comes from the file's mtime.
 
-use minifb::{Key, KeyRepeat, Scale, ScaleMode, Window, WindowOptions};
+use minifb::{Key, KeyRepeat, Scale, Window, WindowOptions};
 use std::time::{Duration, Instant, SystemTime};
 
 const W: usize = 90; // world cells
 const H: usize = 66;
-const PX: usize = 8; // pixels per cell
+const PX: usize = 8; // pixels per cell at the default zoom, where the whole world fits
+const MAP_PW: usize = W * PX; // map viewport, 720 x 528
+const MAP_PH: usize = H * PX;
+const ZOOM_MIN: usize = PX; // below this the world would not cover the viewport
+const ZOOM_MAX: usize = 24;
 const WIN_W: usize = 960;
 const WIN_H: usize = 640;
 const MAP_X: usize = 10;
@@ -93,12 +97,15 @@ struct World {
     log: Vec<(u32, String)>,
     year: u32,
     rng: Rng,
+    base: Vec<u32>,                         // ocean and wilderness, fixed for the world
+    art: [[(u32, u32); 7]; PAL.len()],      // civ colour by fertility, lit and edge
 }
 
 impl World {
     fn new(seed: u64) -> World {
         let mut rng = Rng(seed | 1);
         let fert = terrain(&mut rng);
+        let base = base_colors(&fert);
         let mut w = World {
             fert,
             owner: vec![0; W * H],
@@ -106,6 +113,8 @@ impl World {
             log: Vec::new(),
             year: 0,
             rng,
+            base,
+            art: tribe_colors(),
         };
         for _ in 0..6 {
             w.found();
@@ -418,7 +427,7 @@ fn rect(buf: &mut [u32], x: usize, y: usize, w: usize, h: usize, col: u32) {
 }
 
 /// 5x7 uppercase pixel font. Everything drawn gets upcased, which suits the look.
-const GLYPHS: [[u8; 7]; 44] = [
+const GLYPHS: [[u8; 7]; 45] = [
     [0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11], // A
     [0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E],
     [0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E],
@@ -463,6 +472,7 @@ const GLYPHS: [[u8; 7]; 44] = [
     [0x01, 0x02, 0x02, 0x04, 0x08, 0x08, 0x10], // /
     [0x04, 0x04, 0x04, 0x04, 0x04, 0x00, 0x04], // !
     [0x10, 0x08, 0x04, 0x02, 0x04, 0x08, 0x10], // >
+    [0x01, 0x02, 0x04, 0x08, 0x04, 0x02, 0x01], // <
 ];
 
 fn glyph(c: char) -> &'static [u8; 7] {
@@ -476,6 +486,7 @@ fn glyph(c: char) -> &'static [u8; 7] {
         '/' => 41,
         '!' => 42,
         '>' => 43,
+        '<' => 44,
         _ => 36,
     };
     &GLYPHS[i]
@@ -502,41 +513,94 @@ fn text(buf: &mut [u32], x: usize, y: usize, s: &str, col: u32, scale: usize) ->
     cx
 }
 
-fn render(w: &World, buf: &mut [u32]) {
-    buf.fill(BG);
-
-    for y in 0..H {
-        for x in 0..W {
-            let i = y * W + x;
-            let f = w.fert[i] as u32;
-            let o = w.owner[i] as usize;
-            let col = if f < 3 {
-                // Ocean, lighter where it laps against a coast.
+/// Everything on the map that never changes: ocean depth with its coastal highlight,
+/// and unclaimed land by fertility. Computed once, because at 8 pixels a cell a pan
+/// touches 380k pixels and none of this is worth recomputing per frame.
+fn base_colors(fert: &[u8]) -> Vec<u32> {
+    (0..W * H)
+        .map(|i| {
+            let f = fert[i] as u32;
+            if f < 3 {
                 let base = rgb(9 + f * 3, 24 + f * 8, 44 + f * 14);
-                if neighbours(x, y).any(|j| w.fert[j] >= 3) {
+                if neighbours(i % W, i / W).any(|j| fert[j] >= 3) {
                     shade(base, 1.5)
                 } else {
                     base
                 }
-            } else if o == 0 {
+            } else {
                 let g = f - 3;
                 rgb(44 + g * 3, 62 + g * 8, 38 + g * 3)
+            }
+        })
+        .collect()
+}
+
+/// Every civ colour at every fertility, plus the darker edge variant. 12 x 7 entries,
+/// so the inner pixel loop is two array lookups instead of floating point per pixel.
+fn tribe_colors() -> [[(u32, u32); 7]; PAL.len()] {
+    let mut t = [[(0, 0); 7]; PAL.len()];
+    for (c, &p) in PAL.iter().enumerate() {
+        for f in 0..7 {
+            // Most land sits at the low end of the fertility range, so the floor here
+            // is what sets the overall brightness, not the span.
+            let lit = shade(p, 0.75 + 0.042 * f as f64);
+            t[c][f] = (lit, shade(lit, 0.5));
+        }
+    }
+    t
+}
+
+/// Fill in map viewport coordinates, clipped to it, so a cell straddling the edge of
+/// the view draws only its visible part instead of bleeding over the panel.
+fn vfill(buf: &mut [u32], vx: i32, vy: i32, vw: i32, vh: i32, col: u32) {
+    let (x0, y0) = (vx.max(0), vy.max(0));
+    let (x1, y1) = (
+        (vx + vw).min(MAP_PW as i32),
+        (vy + vh).min(MAP_PH as i32),
+    );
+    for y in y0..y1 {
+        let row = (MAP_Y + y as usize) * WIN_W + MAP_X;
+        for x in x0..x1 {
+            buf[row + x as usize] = col;
+        }
+    }
+}
+
+fn clamp_cam(cam: (i32, i32), zoom: usize) -> (i32, i32) {
+    let (mx, my) = (
+        (W * zoom - MAP_PW) as i32,
+        (H * zoom - MAP_PH) as i32,
+    );
+    (cam.0.clamp(0, mx), cam.1.clamp(0, my))
+}
+
+fn render(w: &World, buf: &mut [u32], cam: (i32, i32), zoom: usize) {
+    buf.fill(BG);
+
+    // Only the cells the viewport can see, drawn as clipped rectangles. Walking pixels
+    // instead and dividing per pixel to find the cell was five times slower.
+    let z = zoom as i32;
+    let (cx0, cy0) = (cam.0 as usize / zoom, cam.1 as usize / zoom);
+    let cx1 = ((cam.0 as usize + MAP_PW - 1) / zoom).min(W - 1);
+    let cy1 = ((cam.1 as usize + MAP_PH - 1) / zoom).min(H - 1);
+    for cy in cy0..=cy1 {
+        for cx in cx0..=cx1 {
+            let i = cy * W + cx;
+            let o = w.owner[i] as usize;
+            let (lit, dark) = if o == 0 {
+                (w.base[i], shade(w.base[i], 0.5))
             } else {
-                // Most land sits at the low end of the fertility range, so the floor
-                // here is what sets the overall brightness, not the span.
-                shade(PAL[w.tribes[o - 1].col], 0.75 + 0.042 * (f - 3) as f64)
+                w.art[w.tribes[o - 1].col][(w.fert[i] - 3) as usize]
             };
+            let (vx, vy) = ((cx * zoom) as i32 - cam.0, (cy * zoom) as i32 - cam.1);
+            vfill(buf, vx, vy, z, z, lit);
             // A darker edge wherever ownership changes: this is what makes it read as
             // a map of realms rather than a field of coloured dots.
-            let right = x + 1 < W && w.owner[i + 1] != w.owner[i];
-            let down = y + 1 < H && w.owner[i + W] != w.owner[i];
-            let (px0, py0) = (MAP_X + x * PX, MAP_Y + y * PX);
-            for dy in 0..PX {
-                for dx in 0..PX {
-                    let edge = (right && dx == PX - 1) || (down && dy == PX - 1);
-                    buf[(py0 + dy) * WIN_W + px0 + dx] =
-                        if edge { shade(col, 0.5) } else { col };
-                }
+            if cx + 1 < W && w.owner[i + 1] as usize != o {
+                vfill(buf, vx + z - 1, vy, 1, z, dark);
+            }
+            if cy + 1 < H && w.owner[i + W] as usize != o {
+                vfill(buf, vx, vy + z - 1, z, 1, dark);
             }
         }
     }
@@ -574,12 +638,14 @@ fn render(w: &World, buf: &mut [u32]) {
     }
 
     // Always on screen, because in borderless mode this is the only way out.
+    let hint = shade(DIM, 0.8);
+    text(buf, PANEL_X, WIN_H - 28, "DRAG PAN   WHEEL ZOOM", hint, 1);
     text(
         buf,
         PANEL_X,
         WIN_H - 16,
         "ESC SETTINGS  SPACE PAUSE  Q QUIT",
-        shade(DIM, 0.8),
+        hint,
         1,
     );
 
@@ -700,8 +766,11 @@ fn open_window(s: &Settings) -> Window {
                 2 | 3 => Scale::X2,
                 _ => Scale::X1,
             },
-            scale_mode: ScaleMode::AspectRatioStretch,
-            resize: !s.borderless,
+            // Resize stays off on purpose: minifb scales mouse positions by the integer
+            // scale factor only, with a "needs to be fixed with resize support" note in
+            // its source, so a drag-resized window puts every click in the wrong place.
+            // Window size comes from the scale setting instead.
+            resize: false,
             none: s.borderless,
             borderless: s.borderless,
             title: !s.borderless,
@@ -712,12 +781,45 @@ fn open_window(s: &Settings) -> Window {
     .expect("open window")
 }
 
+const MENU_W: usize = 420;
+const MENU_H: usize = 214;
+/// Shared by the drawing and the clicking, so they cannot disagree about where a row is.
+fn menu_at() -> (usize, usize) {
+    (
+        MAP_X + (MAP_PW - MENU_W) / 2,
+        MAP_Y + (MAP_PH - MENU_H) / 2,
+    )
+}
+fn menu_row_y(row: usize) -> usize {
+    menu_at().1 + 52 + row * 26
+}
+
+/// Which row and which direction a click at buffer position (x, y) means. `None` when
+/// the click is outside the box, which the caller treats as closing the menu.
+fn menu_hit(x: usize, y: usize) -> Option<(usize, i32)> {
+    let (bx, by) = menu_at();
+    if x < bx || y < by || x >= bx + MENU_W || y >= by + MENU_H {
+        return None;
+    }
+    for row in 0..Settings::ROWS {
+        let ry = menu_row_y(row);
+        if y + 6 >= ry && y < ry + 20 {
+            let d = if (bx + 216..bx + 244).contains(&x) {
+                -1
+            } else if (bx + 372..bx + 400).contains(&x) {
+                1
+            } else {
+                0
+            };
+            return Some((row, d));
+        }
+    }
+    Some((usize::MAX, 0)) // inside the box but not on a row: swallow the click
+}
+
 fn draw_menu(buf: &mut [u32], sel: usize, s: &Settings) {
-    let (bw, bh) = (420usize, 214usize);
-    let (x, y) = (
-        MAP_X + (W * PX - bw) / 2,
-        MAP_Y + (H * PX - bh) / 2,
-    );
+    let (bw, bh) = (MENU_W, MENU_H);
+    let (x, y) = menu_at();
     rect(buf, x, y, bw, bh, 0x121822);
     rect(buf, x, y, bw, 1, INK);
     rect(buf, x, y + bh - 1, bw, 1, INK);
@@ -733,17 +835,20 @@ fn draw_menu(buf: &mut [u32], sel: usize, s: &Settings) {
         ("ALWAYS ON TOP", on_off(s.topmost).to_string()),
     ];
     for (i, (k, v)) in rows.iter().enumerate() {
-        let ry = y + 52 + i * 26;
+        let ry = menu_row_y(i);
         let hot = i == sel;
         let col = if hot { 0xE8C05A } else { INK };
         if hot {
             text(buf, x + 20, ry, ">", col, 2);
         }
         text(buf, x + 40, ry, k, col, 2);
-        text(buf, x + 236, ry, v, if hot { col } else { DIM }, 2);
+        // Clickable arrows, at the coordinates menu_hit tests against.
+        text(buf, x + 220, ry, "<", if hot { col } else { DIM }, 2);
+        text(buf, x + 246, ry, v, if hot { col } else { DIM }, 2);
+        text(buf, x + 376, ry, ">", if hot { col } else { DIM }, 2);
     }
-    text(buf, x + 20, y + bh - 40, "UP DOWN PICK    LEFT RIGHT CHANGE", DIM, 1);
-    text(buf, x + 20, y + bh - 26, "ESC CLOSE AND SAVE    SPACE PAUSE    Q QUIT", DIM, 1);
+    text(buf, x + 20, y + bh - 40, "CLICK THE ARROWS, OR UP DOWN LEFT RIGHT", DIM, 1);
+    text(buf, x + 20, y + bh - 26, "ESC OR CLICK OUTSIDE TO CLOSE AND SAVE", DIM, 1);
 }
 
 /// Usable desktop, so the window can never be opened bigger than the screen.
@@ -765,6 +870,46 @@ fn screen() -> (usize, usize) {
 #[cfg(not(windows))]
 fn screen() -> (usize, usize) {
     (WIN_W, WIN_H)
+}
+
+/// Cursor and window position in screen pixels. minifb can set a window position but
+/// not read one, and its mouse position is client relative, so moving a frameless
+/// window by dragging needs both from the OS or the window chases the cursor.
+#[cfg(windows)]
+fn cursor_and_window(hwnd: *mut std::ffi::c_void) -> ((i32, i32), (i32, i32)) {
+    #[repr(C)]
+    struct Point {
+        x: i32,
+        y: i32,
+    }
+    #[repr(C)]
+    struct Rect {
+        l: i32,
+        t: i32,
+        r: i32,
+        b: i32,
+    }
+    unsafe extern "system" {
+        fn GetCursorPos(p: *mut Point) -> i32;
+        fn GetWindowRect(h: *mut std::ffi::c_void, r: *mut Rect) -> i32;
+    }
+    unsafe {
+        let mut p = Point { x: 0, y: 0 };
+        let mut r = Rect {
+            l: 0,
+            t: 0,
+            r: 0,
+            b: 0,
+        };
+        GetCursorPos(&mut p);
+        GetWindowRect(hwnd, &mut r);
+        ((p.x, p.y), (r.l, r.t))
+    }
+}
+
+#[cfg(not(windows))]
+fn cursor_and_window(_hwnd: *mut std::ffi::c_void) -> ((i32, i32), (i32, i32)) {
+    ((0, 0), (0, 0))
 }
 
 /// 24-bit BMP, bottom-up. Lets you keep a picture of a world, and is how the look of
@@ -859,17 +1004,22 @@ fn main() {
     let mut buf = vec![BG; WIN_W * WIN_H];
     if let Some(path) = arg("--shot") {
         w.tick();
-        render(&w, &mut buf);
+        render(&w, &mut buf, (0, 0), ZOOM_MIN);
         write_bmp(&path, &buf).expect("write bmp");
         return;
     }
 
-    // ponytail: the world grid is fixed, so "window size" resizes the view, not the
-    // map. Drag the frame or set scale; the picture stretches and keeps its aspect.
+    // ponytail: the world grid is fixed, so the scale setting resizes the view of it.
+    // Panning and zooming move the camera over the same 90x66 world.
     let mut win = open_window(&set);
 
     let mut last = Instant::now();
     let (mut paused, mut menu, mut sel, mut quit, mut dirty) = (false, false, 0usize, false, true);
+    let mut zoom = ZOOM_MIN;
+    let mut cam = (0i32, 0i32);
+    // What a held left button is doing: panning the map, or carrying the whole window.
+    let mut grab: Option<((i32, i32), (i32, i32), bool)> = None;
+    let mut was_down = false;
     while win.is_open() && !quit {
         // Esc opens settings, it does not quit: this thing is meant to be left running.
         if win.is_key_pressed(Key::Escape, KeyRepeat::No) {
@@ -908,6 +1058,108 @@ fn main() {
             paused = !paused;
         }
 
+        // Mouse. Positions come back in buffer pixels, which is what everything drawn
+        // here is measured in, so no conversion.
+        let mouse = win.get_mouse_pos(minifb::MouseMode::Discard);
+        let down = win.get_mouse_down(minifb::MouseButton::Left);
+        let click = down && !was_down;
+        was_down = down;
+        let on_map = mouse.is_some_and(|(mx, my)| {
+            (MAP_X..MAP_X + MAP_PW).contains(&(mx as usize))
+                && (MAP_Y..MAP_Y + MAP_PH).contains(&(my as usize))
+        });
+
+        if let Some((mx, my)) = mouse {
+            let (mx, my) = (mx as usize, my as usize);
+            if menu && click {
+                match menu_hit(mx, my) {
+                    Some((row, d)) if row != usize::MAX => {
+                        sel = row;
+                        if d != 0 {
+                            if set.adjust(row, d) {
+                                win = open_window(&set);
+                            } else {
+                                win.topmost(set.topmost);
+                            }
+                        }
+                    }
+                    Some(_) => {}
+                    None => {
+                        menu = false;
+                        let _ = std::fs::write(CFG, cfg_text(&set));
+                    }
+                }
+                dirty = true;
+            } else if !menu && click && my >= WIN_H - 32 && mx >= PANEL_X {
+                menu = true; // the hint line doubles as the settings button
+                dirty = true;
+            }
+        }
+
+        // Wheel zoom, anchored on the cursor so the cell under it stays put.
+        if let Some((_, sy)) = win.get_scroll_wheel() {
+            if sy != 0.0 && !menu {
+                let old = zoom;
+                zoom = if sy > 0.0 {
+                    (zoom + 4).min(ZOOM_MAX)
+                } else {
+                    zoom.saturating_sub(4).max(ZOOM_MIN)
+                };
+                if zoom != old {
+                    let (ax, ay) = mouse
+                        .filter(|_| on_map)
+                        .map_or((MAP_PW as f32 / 2.0, MAP_PH as f32 / 2.0), |(mx, my)| {
+                            (mx - MAP_X as f32, my - MAP_Y as f32)
+                        });
+                    let k = zoom as f32 / old as f32;
+                    cam.0 = ((cam.0 as f32 + ax) * k - ax) as i32;
+                    cam.1 = ((cam.1 as f32 + ay) * k - ay) as i32;
+                    cam = clamp_cam(cam, zoom);
+                    dirty = true;
+                }
+            }
+        }
+
+        // Dragging: on the map it pans, on the surrounding chrome it carries a frameless
+        // window, which otherwise has no title bar to grab.
+        if !menu {
+            let hwnd = win.get_window_handle();
+            if click {
+                let (cur, wpos) = cursor_and_window(hwnd);
+                grab = Some((cur, if on_map { cam } else { wpos }, on_map));
+            } else if !down {
+                grab = None;
+            }
+            if let Some((anchor, start, panning)) = grab {
+                if down {
+                    let (cur, _) = cursor_and_window(hwnd);
+                    let (dx, dy) = (cur.0 - anchor.0, cur.1 - anchor.1);
+                    if panning {
+                        let next = clamp_cam((start.0 - dx, start.1 - dy), zoom);
+                        if next != cam {
+                            cam = next;
+                            dirty = true;
+                        }
+                    } else if (dx, dy) != (0, 0) && set.borderless {
+                        win.set_position((start.0 + dx) as isize, (start.1 + dy) as isize);
+                    }
+                }
+            }
+        }
+        // Arrows pan when the settings screen is not using them.
+        if !menu {
+            let step = (zoom * 2) as i32;
+            let dx = win.is_key_down(Key::Right) as i32 - win.is_key_down(Key::Left) as i32;
+            let dy = win.is_key_down(Key::Down) as i32 - win.is_key_down(Key::Up) as i32;
+            if (dx, dy) != (0, 0) {
+                let next = clamp_cam((cam.0 + dx * step, cam.1 + dy * step), zoom);
+                if next != cam {
+                    cam = next;
+                    dirty = true;
+                }
+            }
+        }
+
         if !paused && !menu && last.elapsed() >= Duration::from_millis(set.speed) {
             last = Instant::now();
             w.tick();
@@ -919,17 +1171,51 @@ fn main() {
         // The menu redraws the world under itself every frame, otherwise the old
         // selection marker stays behind while the world sits paused.
         if dirty || menu {
-            render(&w, &mut buf);
+            render(&w, &mut buf, cam, zoom);
             if menu {
                 draw_menu(&mut buf, sel, &set);
             }
             dirty = false;
+            let _ = win.update_with_buffer(&buf, WIN_W, WIN_H);
+        } else {
+            // Pump input without pushing 2.4 MB the window already has. Blitting every
+            // loop regardless of change was costing about 4% of a core to show a
+            // picture that changes five times a second.
+            win.update();
         }
-        let _ = win.update_with_buffer(&buf, WIN_W, WIN_H);
         std::thread::sleep(Duration::from_millis(8));
     }
     let _ = std::fs::write(SAVE, format!("{seed} {}", w.year));
     let _ = std::fs::write(CFG, cfg_text(&set));
+}
+
+#[test]
+#[ignore]
+fn bench() {
+    let mut w = World::new(7);
+    for _ in 0..2000 {
+        w.tick();
+    }
+    let t = Instant::now();
+    for _ in 0..20000 {
+        w.tick();
+    }
+    let tick = t.elapsed().as_secs_f64() / 20000.0 * 1e6;
+
+    let mut buf = vec![0u32; WIN_W * WIN_H];
+    let t = Instant::now();
+    for _ in 0..2000 {
+        render(&w, &mut buf, (0, 0), ZOOM_MIN);
+    }
+    let out = t.elapsed().as_secs_f64() / 2000.0 * 1e6;
+    let t = Instant::now();
+    for _ in 0..2000 {
+        render(&w, &mut buf, (300, 200), 16);
+    }
+    let zoomed = t.elapsed().as_secs_f64() / 2000.0 * 1e6;
+    println!(
+        "tick {tick:.1} us   render {out:.1} us   render zoomed {zoomed:.1} us   60fps budget 16666 us"
+    );
 }
 
 /// The settings screen can't be clicked from a test, so the keystroke logic and the
