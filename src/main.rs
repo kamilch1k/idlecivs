@@ -3,7 +3,7 @@
 // ponytail: the save file is "<seed> <year>" - the sim is deterministic, so resuming
 // is just a replay and there is no serializer. Time away comes from the file's mtime.
 
-use minifb::{Key, KeyRepeat, Scale, Window, WindowOptions};
+use minifb::{Key, KeyRepeat, Scale, ScaleMode, Window, WindowOptions};
 use std::time::{Duration, Instant, SystemTime};
 
 const W: usize = 90; // world cells
@@ -17,6 +17,14 @@ const PANEL_X: usize = MAP_X + W * PX + 10; // 740
 const LOG_Y: usize = MAP_Y + H * PX + 10; // 548
 
 const SAVE: &str = "civ.save";
+const CFG: &str = "civ.cfg";
+const DEFAULT_CFG: &str = "\
+# idle civilizations. delete this file to get the defaults back.
+speed 200        # milliseconds per year, lower is faster (+ and - change it live)
+scale 1          # window size: 1, 2 or 4, clamped to what fits your screen
+borderless 0     # 1 = no title bar and no frame. esc quits, there is no close button
+topmost 0        # 1 = keep above other windows. with borderless 1 this covers things up
+";
 const MAX_OFFLINE: u32 = 5_000; // the world only ages so much while you're gone
 /// The size at which a realm's reach peaks and rebellion starts to bite. Everything
 /// about the balance keys off this, so it scales with the map instead of the constants.
@@ -570,6 +578,16 @@ fn render(w: &World, buf: &mut [u32]) {
         );
     }
 
+    // Always on screen, because in borderless mode this is the only way out.
+    text(
+        buf,
+        PANEL_X,
+        WIN_H - 16,
+        "SPACE PAUSE  +/- SPEED  ESC QUIT",
+        shade(DIM, 0.8),
+        1,
+    );
+
     // Chronicle.
     rect(buf, MAP_X, LOG_Y - 6, WIN_W - 2 * MAP_X, 1, LINE);
     for (row, (year, msg)) in w.log.iter().rev().take(4).rev().enumerate() {
@@ -587,6 +605,27 @@ fn neighbours(x: usize, y: usize) -> impl Iterator<Item = usize> {
             (nx >= 0 && ny >= 0 && (nx as usize) < W && (ny as usize) < H)
                 .then(|| ny as usize * W + nx as usize)
         })
+}
+
+/// Usable desktop, so the window can never be opened bigger than the screen.
+#[cfg(windows)]
+fn screen() -> (usize, usize) {
+    unsafe extern "system" {
+        fn GetSystemMetrics(i: i32) -> i32;
+    }
+    // SM_CXFULLSCREEN / SM_CYFULLSCREEN: the client area of a maximised window, so
+    // the taskbar is already excluded.
+    unsafe {
+        (
+            GetSystemMetrics(16).max(640) as usize,
+            GetSystemMetrics(17).max(480) as usize,
+        )
+    }
+}
+
+#[cfg(not(windows))]
+fn screen() -> (usize, usize) {
+    (WIN_W, WIN_H)
 }
 
 /// 24-bit BMP, bottom-up. Lets you keep a picture of a world, and is how the look of
@@ -628,6 +667,34 @@ fn main() {
             .map_or(0x9E37_79B9, |d| d.as_nanos() as u64)
     };
 
+    // Settings come from civ.cfg, which is written out on first run so there is
+    // something to find and edit. Command line flags override it.
+    let cfg = std::fs::read_to_string(CFG).unwrap_or_else(|_| {
+        let _ = std::fs::write(CFG, DEFAULT_CFG);
+        DEFAULT_CFG.to_string()
+    });
+    let (mut speed, mut scale, mut borderless, mut topmost) = (200u64, "1".to_string(), false, false);
+    for line in cfg.lines() {
+        let mut it = line.split('#').next().unwrap_or("").split_whitespace();
+        let yes = |v: &str| v == "1" || v == "true" || v == "yes";
+        match (it.next(), it.next()) {
+            (Some("speed"), Some(v)) => speed = v.parse().unwrap_or(speed),
+            (Some("scale"), Some(v)) => scale = v.to_string(),
+            (Some("borderless"), Some(v)) => borderless = yes(v),
+            (Some("topmost"), Some(v)) => topmost = yes(v),
+            _ => {}
+        }
+    }
+    if let Some(v) = arg("--speed") {
+        speed = v.parse().unwrap_or(speed);
+    }
+    if let Some(v) = arg("--scale") {
+        scale = v;
+    }
+    borderless |= args.iter().any(|a| a == "--borderless");
+    topmost |= args.iter().any(|a| a == "--topmost");
+    let speed = speed.clamp(8, 5000);
+
     let saved = std::fs::read_to_string(SAVE).unwrap_or_default();
     let mut it = saved.split_whitespace();
     let (mut seed, mut year) = (
@@ -635,11 +702,12 @@ fn main() {
         it.next().and_then(|s| s.parse().ok()).unwrap_or(0u32),
     );
     // Years that passed while the program wasn't running: that is the idle part.
+    // Measured in configured years, so a faster game also ages faster while away.
     let away = std::fs::metadata(SAVE)
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.elapsed().ok())
-        .map_or(0, |d| d.as_millis() as u32 / 200)
+        .map_or(0, |d| (d.as_millis() / speed as u128) as u32)
         .min(MAX_OFFLINE);
     if args.iter().any(|a| a == "--fresh") {
         (seed, year) = (now(), 0);
@@ -661,18 +729,43 @@ fn main() {
         return;
     }
 
+    // Clamped to what the screen can actually hold. An oversized always-on-top window
+    // with no title bar has no close button and no edges to drag: it just eats the
+    // desktop. Never let a settings value put the user in that position.
+    let want: u32 = match scale.as_str() {
+        "2" => 2,
+        "4" => 4,
+        _ => 1,
+    };
+    let (sw, sh) = screen();
+    let fits = ((sw / WIN_W).min(sh / WIN_H) as u32).max(1);
+    // ponytail: the world grid is fixed, so "window size" resizes the view, not the
+    // map. Drag the frame or set scale; the picture stretches and keeps its aspect.
     let mut win = Window::new(
         "idle civilizations",
         WIN_W,
         WIN_H,
         WindowOptions {
-            scale: Scale::X1,
+            scale: match want.min(fits) {
+                4 => Scale::X4,
+                2 | 3 => Scale::X2,
+                _ => Scale::X1,
+            },
+            scale_mode: ScaleMode::AspectRatioStretch,
+            resize: !borderless,
+            // `none` is the one that actually removes the chrome: minifb's `borderless`
+            // only drops WS_THICKFRAME, and a zero window style is WS_OVERLAPPED, which
+            // has a title bar by definition. Verified against the window's style bits.
+            none: borderless,
+            borderless,
+            title: !borderless,
+            topmost,
             ..WindowOptions::default()
         },
     )
     .expect("open window");
 
-    let mut step = Duration::from_millis(200); // one year
+    let mut step = Duration::from_millis(speed); // one year
     let mut last = Instant::now();
     let mut paused = false;
     render(&w, &mut buf);
