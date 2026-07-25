@@ -639,7 +639,14 @@ fn render(w: &World, buf: &mut [u32], cam: (i32, i32), zoom: usize) {
 
     // Always on screen, because in borderless mode this is the only way out.
     let hint = shade(DIM, 0.8);
-    text(buf, PANEL_X, WIN_H - 28, "DRAG PAN   WHEEL ZOOM", hint, 1);
+    text(
+        buf,
+        PANEL_X,
+        WIN_H - 28,
+        "DRAG PAN   WHEEL OR PGUP ZOOM",
+        hint,
+        1,
+    );
     text(
         buf,
         PANEL_X,
@@ -829,7 +836,7 @@ fn draw_menu(buf: &mut [u32], sel: usize, s: &Settings) {
 
     let on_off = |v: bool| if v { "ON" } else { "OFF" };
     let rows = [
-        ("SPEED", format!("{} MS/YEAR", s.speed)),
+        ("SPEED", format!("{} MS", s.speed)),
         ("WINDOW", format!("{}X", s.scale)),
         ("TITLE BAR", on_off(!s.borderless).to_string()),
         ("ALWAYS ON TOP", on_off(s.topmost).to_string()),
@@ -1096,8 +1103,14 @@ fn main() {
             }
         }
 
-        // Wheel zoom, anchored on the cursor so the cell under it stays put.
-        if let Some((_, sy)) = win.get_scroll_wheel() {
+        // Wheel zoom, anchored on the cursor so the cell under it stays put. Page up and
+        // down do the same: Windows only delivers wheel events to the focused window, so
+        // hovering an unfocused window and scrolling looks like nothing is wired up.
+        let wheel = win.get_scroll_wheel().map_or(0.0, |(_, sy)| sy)
+            + win.is_key_pressed(Key::PageUp, KeyRepeat::No) as i32 as f32
+            - win.is_key_pressed(Key::PageDown, KeyRepeat::No) as i32 as f32;
+        {
+            let sy = wheel;
             if sy != 0.0 && !menu {
                 let old = zoom;
                 zoom = if sy > 0.0 {

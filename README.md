@@ -2,7 +2,15 @@
 
 A world of civilizations that plays itself in a small window. There is nothing to click.
 
-![screenshot](screenshot.png)
+![the world at year 14,000](screenshot.png)
+
+Zoom in and the provinces get room to breathe. Drag to look around.
+
+![zoomed in on a contested coast](zoomed.png)
+
+`esc` opens the settings, over the paused world.
+
+![the settings screen](settings.png)
 
 Peoples grow, discover, spread along their coasts, fight over borders, split apart when
 they get too big, and die. You watch. Close it, come back tomorrow, and the world has
