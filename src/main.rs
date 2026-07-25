@@ -18,13 +18,6 @@ const LOG_Y: usize = MAP_Y + H * PX + 10; // 548
 
 const SAVE: &str = "civ.save";
 const CFG: &str = "civ.cfg";
-const DEFAULT_CFG: &str = "\
-# idle civilizations. delete this file to get the defaults back.
-speed 200        # milliseconds per year, lower is faster (+ and - change it live)
-scale 1          # window size: 1, 2 or 4, clamped to what fits your screen
-borderless 0     # 1 = no title bar and no frame. esc quits, there is no close button
-topmost 0        # 1 = keep above other windows. with borderless 1 this covers things up
-";
 const MAX_OFFLINE: u32 = 5_000; // the world only ages so much while you're gone
 /// The size at which a realm's reach peaks and rebellion starts to bite. Everything
 /// about the balance keys off this, so it scales with the map instead of the constants.
@@ -425,7 +418,7 @@ fn rect(buf: &mut [u32], x: usize, y: usize, w: usize, h: usize, col: u32) {
 }
 
 /// 5x7 uppercase pixel font. Everything drawn gets upcased, which suits the look.
-const GLYPHS: [[u8; 7]; 43] = [
+const GLYPHS: [[u8; 7]; 44] = [
     [0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11], // A
     [0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E],
     [0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E],
@@ -469,6 +462,7 @@ const GLYPHS: [[u8; 7]; 43] = [
     [0x00, 0x0C, 0x0C, 0x00, 0x0C, 0x0C, 0x00], // :
     [0x01, 0x02, 0x02, 0x04, 0x08, 0x08, 0x10], // /
     [0x04, 0x04, 0x04, 0x04, 0x04, 0x00, 0x04], // !
+    [0x10, 0x08, 0x04, 0x02, 0x04, 0x08, 0x10], // >
 ];
 
 fn glyph(c: char) -> &'static [u8; 7] {
@@ -481,6 +475,7 @@ fn glyph(c: char) -> &'static [u8; 7] {
         ':' => 40,
         '/' => 41,
         '!' => 42,
+        '>' => 43,
         _ => 36,
     };
     &GLYPHS[i]
@@ -583,7 +578,7 @@ fn render(w: &World, buf: &mut [u32]) {
         buf,
         PANEL_X,
         WIN_H - 16,
-        "SPACE PAUSE  +/- SPEED  ESC QUIT",
+        "ESC SETTINGS  SPACE PAUSE  Q QUIT",
         shade(DIM, 0.8),
         1,
     );
@@ -605,6 +600,150 @@ fn neighbours(x: usize, y: usize) -> impl Iterator<Item = usize> {
             (nx >= 0 && ny >= 0 && (nx as usize) < W && (ny as usize) < H)
                 .then(|| ny as usize * W + nx as usize)
         })
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Settings {
+    speed: u64, // milliseconds per year
+    scale: u32,
+    borderless: bool,
+    topmost: bool,
+}
+
+impl Settings {
+    const ROWS: usize = 4;
+
+    /// One left/right press on a settings row. Right always means more of the thing:
+    /// faster, bigger, on. Returns whether the window has to be reopened for it.
+    fn adjust(&mut self, row: usize, d: i32) -> bool {
+        match row {
+            0 => {
+                self.speed = if d > 0 {
+                    (self.speed / 2).max(8)
+                } else {
+                    (self.speed * 2).min(5000)
+                };
+                false
+            }
+            1 => {
+                // 3 is skipped: minifb has no X3, so it would silently behave as X2.
+                self.scale = match (self.scale, d > 0) {
+                    (1, true) => 2,
+                    (2, true) => 4,
+                    (4, false) => 2,
+                    (2, false) => 1,
+                    (s, _) => s,
+                };
+                true
+            }
+            2 => {
+                self.borderless = !self.borderless;
+                true
+            }
+            _ => {
+                self.topmost = !self.topmost;
+                false // applied live, no new window needed
+            }
+        }
+    }
+}
+
+/// The settings file, also what the settings screen writes back.
+fn cfg_text(s: &Settings) -> String {
+    let b = |v: bool| if v { 1 } else { 0 };
+    format!(
+        "# idle civilizations. delete this file to get the defaults back.
+# esc opens the settings screen in the game and writes this file for you.
+speed {}        # milliseconds per year, lower is faster
+scale {}          # window size: 1, 2 or 4, clamped to what fits your screen
+borderless {}     # 1 = no title bar and no frame
+topmost {}        # 1 = keep above other windows
+",
+        s.speed,
+        s.scale,
+        b(s.borderless),
+        b(s.topmost)
+    )
+}
+
+fn parse_cfg(text: &str, s: &mut Settings) {
+    let yes = |v: &str| v == "1" || v == "true" || v == "yes";
+    for line in text.lines() {
+        let mut it = line.split('#').next().unwrap_or("").split_whitespace();
+        match (it.next(), it.next()) {
+            (Some("speed"), Some(v)) => s.speed = v.parse().unwrap_or(s.speed),
+            (Some("scale"), Some(v)) => s.scale = v.parse().unwrap_or(s.scale),
+            (Some("borderless"), Some(v)) => s.borderless = yes(v),
+            (Some("topmost"), Some(v)) => s.topmost = yes(v),
+            _ => {}
+        }
+    }
+}
+
+/// Opens the window, never bigger than the screen. An oversized always-on-top window
+/// with no title bar has no close button and no edges to drag: it just eats the desktop,
+/// so no settings value is allowed to put the user in that position.
+///
+/// `none` is the option that actually removes the chrome: minifb's `borderless` only
+/// drops WS_THICKFRAME, and a zero window style is WS_OVERLAPPED, which has a title bar
+/// by definition. Checked against the real window's style bits.
+fn open_window(s: &Settings) -> Window {
+    let (sw, sh) = screen();
+    let fits = ((sw / WIN_W).min(sh / WIN_H) as u32).max(1);
+    Window::new(
+        "idle civilizations",
+        WIN_W,
+        WIN_H,
+        WindowOptions {
+            scale: match s.scale.min(fits) {
+                4 => Scale::X4,
+                2 | 3 => Scale::X2,
+                _ => Scale::X1,
+            },
+            scale_mode: ScaleMode::AspectRatioStretch,
+            resize: !s.borderless,
+            none: s.borderless,
+            borderless: s.borderless,
+            title: !s.borderless,
+            topmost: s.topmost,
+            ..WindowOptions::default()
+        },
+    )
+    .expect("open window")
+}
+
+fn draw_menu(buf: &mut [u32], sel: usize, s: &Settings) {
+    let (bw, bh) = (420usize, 214usize);
+    let (x, y) = (
+        MAP_X + (W * PX - bw) / 2,
+        MAP_Y + (H * PX - bh) / 2,
+    );
+    rect(buf, x, y, bw, bh, 0x121822);
+    rect(buf, x, y, bw, 1, INK);
+    rect(buf, x, y + bh - 1, bw, 1, INK);
+    rect(buf, x, y, 1, bh, INK);
+    rect(buf, x + bw - 1, y, 1, bh, INK);
+    text(buf, x + 20, y + 16, "SETTINGS", INK, 2);
+
+    let on_off = |v: bool| if v { "ON" } else { "OFF" };
+    let rows = [
+        ("SPEED", format!("{} MS/YEAR", s.speed)),
+        ("WINDOW", format!("{}X", s.scale)),
+        ("TITLE BAR", on_off(!s.borderless).to_string()),
+        ("ALWAYS ON TOP", on_off(s.topmost).to_string()),
+    ];
+    for (i, (k, v)) in rows.iter().enumerate() {
+        let ry = y + 52 + i * 26;
+        let hot = i == sel;
+        let col = if hot { 0xE8C05A } else { INK };
+        if hot {
+            text(buf, x + 20, ry, ">", col, 2);
+        }
+        text(buf, x + 40, ry, k, col, 2);
+        text(buf, x + 236, ry, v, if hot { col } else { DIM }, 2);
+    }
+    text(buf, x + 20, y + bh - 40, "UP DOWN PICK    LEFT RIGHT CHANGE", DIM, 1);
+    text(buf, x + 20, y + bh - 26, "ESC CLOSE AND SAVE    SPACE PAUSE    Q QUIT", DIM, 1);
 }
 
 /// Usable desktop, so the window can never be opened bigger than the screen.
@@ -669,31 +808,27 @@ fn main() {
 
     // Settings come from civ.cfg, which is written out on first run so there is
     // something to find and edit. Command line flags override it.
-    let cfg = std::fs::read_to_string(CFG).unwrap_or_else(|_| {
-        let _ = std::fs::write(CFG, DEFAULT_CFG);
-        DEFAULT_CFG.to_string()
-    });
-    let (mut speed, mut scale, mut borderless, mut topmost) = (200u64, "1".to_string(), false, false);
-    for line in cfg.lines() {
-        let mut it = line.split('#').next().unwrap_or("").split_whitespace();
-        let yes = |v: &str| v == "1" || v == "true" || v == "yes";
-        match (it.next(), it.next()) {
-            (Some("speed"), Some(v)) => speed = v.parse().unwrap_or(speed),
-            (Some("scale"), Some(v)) => scale = v.to_string(),
-            (Some("borderless"), Some(v)) => borderless = yes(v),
-            (Some("topmost"), Some(v)) => topmost = yes(v),
-            _ => {}
+    let mut set = Settings {
+        speed: 200,
+        scale: 1,
+        borderless: false,
+        topmost: false,
+    };
+    match std::fs::read_to_string(CFG) {
+        Ok(t) => parse_cfg(&t, &mut set),
+        Err(_) => {
+            let _ = std::fs::write(CFG, cfg_text(&set));
         }
     }
     if let Some(v) = arg("--speed") {
-        speed = v.parse().unwrap_or(speed);
+        set.speed = v.parse().unwrap_or(set.speed);
     }
     if let Some(v) = arg("--scale") {
-        scale = v;
+        set.scale = v.parse().unwrap_or(set.scale);
     }
-    borderless |= args.iter().any(|a| a == "--borderless");
-    topmost |= args.iter().any(|a| a == "--topmost");
-    let speed = speed.clamp(8, 5000);
+    set.borderless |= args.iter().any(|a| a == "--borderless");
+    set.topmost |= args.iter().any(|a| a == "--topmost");
+    set.speed = set.speed.clamp(8, 5000);
 
     let saved = std::fs::read_to_string(SAVE).unwrap_or_default();
     let mut it = saved.split_whitespace();
@@ -707,7 +842,7 @@ fn main() {
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.elapsed().ok())
-        .map_or(0, |d| (d.as_millis() / speed as u128) as u32)
+        .map_or(0, |d| (d.as_millis() / set.speed as u128) as u32)
         .min(MAX_OFFLINE);
     if args.iter().any(|a| a == "--fresh") {
         (seed, year) = (now(), 0);
@@ -729,68 +864,121 @@ fn main() {
         return;
     }
 
-    // Clamped to what the screen can actually hold. An oversized always-on-top window
-    // with no title bar has no close button and no edges to drag: it just eats the
-    // desktop. Never let a settings value put the user in that position.
-    let want: u32 = match scale.as_str() {
-        "2" => 2,
-        "4" => 4,
-        _ => 1,
-    };
-    let (sw, sh) = screen();
-    let fits = ((sw / WIN_W).min(sh / WIN_H) as u32).max(1);
     // ponytail: the world grid is fixed, so "window size" resizes the view, not the
     // map. Drag the frame or set scale; the picture stretches and keeps its aspect.
-    let mut win = Window::new(
-        "idle civilizations",
-        WIN_W,
-        WIN_H,
-        WindowOptions {
-            scale: match want.min(fits) {
-                4 => Scale::X4,
-                2 | 3 => Scale::X2,
-                _ => Scale::X1,
-            },
-            scale_mode: ScaleMode::AspectRatioStretch,
-            resize: !borderless,
-            // `none` is the one that actually removes the chrome: minifb's `borderless`
-            // only drops WS_THICKFRAME, and a zero window style is WS_OVERLAPPED, which
-            // has a title bar by definition. Verified against the window's style bits.
-            none: borderless,
-            borderless,
-            title: !borderless,
-            topmost,
-            ..WindowOptions::default()
-        },
-    )
-    .expect("open window");
+    let mut win = open_window(&set);
 
-    let mut step = Duration::from_millis(speed); // one year
     let mut last = Instant::now();
-    let mut paused = false;
-    render(&w, &mut buf);
-    while win.is_open() && !win.is_key_down(Key::Escape) {
+    let (mut paused, mut menu, mut sel, mut quit, mut dirty) = (false, false, 0usize, false, true);
+    while win.is_open() && !quit {
+        // Esc opens settings, it does not quit: this thing is meant to be left running.
+        if win.is_key_pressed(Key::Escape, KeyRepeat::No) {
+            menu = !menu;
+            if !menu {
+                let _ = std::fs::write(CFG, cfg_text(&set));
+            }
+            dirty = true;
+        }
+        if win.is_key_pressed(Key::Q, KeyRepeat::No) {
+            quit = true;
+        }
+        if menu {
+            if win.is_key_pressed(Key::Down, KeyRepeat::Yes) {
+                sel = (sel + 1) % Settings::ROWS;
+            }
+            if win.is_key_pressed(Key::Up, KeyRepeat::Yes) {
+                sel = (sel + Settings::ROWS - 1) % Settings::ROWS;
+            }
+            let d = win.is_key_pressed(Key::Right, KeyRepeat::Yes) as i32
+                - win.is_key_pressed(Key::Left, KeyRepeat::Yes) as i32;
+            if d != 0 {
+                if set.adjust(sel, d) {
+                    win = open_window(&set);
+                } else {
+                    win.topmost(set.topmost);
+                }
+                dirty = true;
+            }
+        } else if win.is_key_pressed(Key::Equal, KeyRepeat::No) {
+            set.adjust(0, 1);
+        } else if win.is_key_pressed(Key::Minus, KeyRepeat::No) {
+            set.adjust(0, -1);
+        }
         if win.is_key_pressed(Key::Space, KeyRepeat::No) {
             paused = !paused;
         }
-        if win.is_key_pressed(Key::Equal, KeyRepeat::No) {
-            step = (step / 2).max(Duration::from_millis(12));
-        }
-        if win.is_key_pressed(Key::Minus, KeyRepeat::No) {
-            step = (step * 2).min(Duration::from_millis(1600));
-        }
-        if !paused && last.elapsed() >= step {
+
+        if !paused && !menu && last.elapsed() >= Duration::from_millis(set.speed) {
             last = Instant::now();
             w.tick();
-            render(&w, &mut buf);
+            dirty = true;
             if w.year % 25 == 0 {
                 let _ = std::fs::write(SAVE, format!("{seed} {}", w.year));
             }
+        }
+        // The menu redraws the world under itself every frame, otherwise the old
+        // selection marker stays behind while the world sits paused.
+        if dirty || menu {
+            render(&w, &mut buf);
+            if menu {
+                draw_menu(&mut buf, sel, &set);
+            }
+            dirty = false;
         }
         let _ = win.update_with_buffer(&buf, WIN_W, WIN_H);
         std::thread::sleep(Duration::from_millis(8));
     }
     let _ = std::fs::write(SAVE, format!("{seed} {}", w.year));
+    let _ = std::fs::write(CFG, cfg_text(&set));
+}
+
+/// The settings screen can't be clicked from a test, so the keystroke logic and the
+/// file round trip are checked directly instead.
+#[test]
+fn settings_keys_and_file_round_trip() {
+    let mut s = Settings {
+        speed: 200,
+        scale: 1,
+        borderless: false,
+        topmost: false,
+    };
+
+    assert!(!s.adjust(0, 1), "speed needs no new window");
+    assert_eq!(s.speed, 100, "right is faster");
+    for _ in 0..20 {
+        s.adjust(0, 1);
+    }
+    assert_eq!(s.speed, 8, "speed clamps instead of reaching zero and dividing by it");
+    for _ in 0..20 {
+        s.adjust(0, -1);
+    }
+    assert_eq!(s.speed, 5000);
+
+    // 3 is not a minifb scale, so the row must step over it in both directions.
+    for want in [2, 4, 4] {
+        assert!(s.adjust(1, 1));
+        assert_eq!(s.scale, want);
+    }
+    for want in [2, 1, 1] {
+        s.adjust(1, -1);
+        assert_eq!(s.scale, want);
+    }
+
+    assert!(s.adjust(2, 1), "frame change needs the window reopened");
+    assert!(s.borderless);
+    assert!(!s.adjust(3, 1), "topmost applies live");
+    assert!(s.topmost);
+
+    // Whatever the menu writes has to read back identically, or closing the settings
+    // screen would silently revert them on the next launch.
+    let mut back = Settings {
+        speed: 1,
+        scale: 1,
+        borderless: false,
+        topmost: false,
+    };
+    parse_cfg(&cfg_text(&s), &mut back);
+    assert_eq!(s, back);
 }
 
 #[test]

@@ -12,7 +12,17 @@ moved on without you.
 cargo run --release
 ```
 
-`space` pause &nbsp;·&nbsp; `+` / `-` speed &nbsp;·&nbsp; `esc` quit &nbsp;·&nbsp; `--fresh` new world &nbsp;·&nbsp; `--shot out.bmp` save a picture
+`esc` settings &nbsp;·&nbsp; `space` pause &nbsp;·&nbsp; `+` / `-` speed &nbsp;·&nbsp; `q` quit
+
+`--fresh` new world &nbsp;·&nbsp; `--shot out.bmp` save a picture &nbsp;·&nbsp; `--speed 60` &nbsp;·&nbsp; `--scale 2` &nbsp;·&nbsp; `--borderless` &nbsp;·&nbsp; `--topmost`
+
+## settings
+
+`esc` opens a settings screen: speed, window size, title bar, always-on-top. Arrow keys
+change things, closing it writes `civ.cfg` next to the executable, which you can also
+edit by hand. The window is never opened larger than your screen — an oversized
+always-on-top window with no title bar has no close button and no edges to drag, and
+just eats the desktop.
 
 ## how the idle part works
 
