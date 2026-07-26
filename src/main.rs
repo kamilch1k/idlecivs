@@ -32,9 +32,21 @@ const INK: u32 = 0xC8D2E0;
 const DIM: u32 = 0x63707F;
 const LINE: u32 = 0x1E2430;
 
+/// Deliberately skips the greens. Territory is a wash over the terrain now, and the
+/// terrain is grass and forest, so a green civ dissolves into the countryside.
 const PAL: [u32; 12] = [
-    0xE05B5B, 0x5B9BE0, 0xE8C05A, 0x7BC96F, 0xB07BE0, 0x5AC8C8, 0xE8905A, 0xC8C8D2, 0xE07BA8,
-    0xA8C85A, 0x8C8FE8, 0x4E9E7A,
+    0xE0574F, // red
+    0xE8863A, // orange
+    0xE8B93A, // amber
+    0xDCD24A, // yellow
+    0x3FC8C0, // cyan
+    0x4FA0E8, // sky
+    0x6E7FE8, // blue
+    0x9E6FE8, // violet
+    0xC760E0, // purple
+    0xE05FB0, // magenta
+    0xE86F8A, // pink
+    0xDCDCE6, // white
 ];
 
 const ERAS: [&str; 12] = [
@@ -73,6 +85,7 @@ struct Tribe {
     born: u32,
     alive: bool,
     col: usize,
+    seat: u32, // where its city is drawn; moves if the cell is lost
 }
 
 impl Tribe {
@@ -97,15 +110,17 @@ struct World {
     log: Vec<(u32, String)>,
     year: u32,
     rng: Rng,
-    base: Vec<u32>,                         // ocean and wilderness, fixed for the world
-    art: [[(u32, u32); 7]; PAL.len()],      // civ colour by fertility, lit and edge
+    terr: Vec<u8>,                        // biome index per cell, fixed for the world
+    tint: [[u32; BIOME_N]; PAL.len()],    // that biome washed with each civ's colour
+    edge: [u32; PAL.len()],               // border line colour per civ
 }
 
 impl World {
     fn new(seed: u64) -> World {
         let mut rng = Rng(seed | 1);
         let fert = terrain(&mut rng);
-        let base = base_colors(&fert);
+        let terr = terrain_art(&fert, seed);
+        let (tint, edge) = tint_tables();
         let mut w = World {
             fert,
             owner: vec![0; W * H],
@@ -113,8 +128,9 @@ impl World {
             log: Vec::new(),
             year: 0,
             rng,
-            base,
-            art: tribe_colors(),
+            terr,
+            tint,
+            edge,
         };
         for _ in 0..6 {
             w.found();
@@ -173,6 +189,7 @@ impl World {
             born: self.year,
             alive: true,
             col,
+            seat: at as u32,
         };
         let idx = match self.tribes.iter().position(|t| !t.alive) {
             Some(i) => {
@@ -217,6 +234,14 @@ impl World {
                 self.tribes[o - 1].land += 1;
                 food[o - 1] += self.fert[i] as f64;
                 cells[o - 1].push(i as u32);
+            }
+        }
+        // A city that fell to someone else is rebuilt on land the people still hold.
+        for (i, t) in self.tribes.iter_mut().enumerate() {
+            if t.alive && self.owner[t.seat as usize] as usize != i + 1 {
+                if let Some(&c) = cells[i].first() {
+                    t.seat = c;
+                }
             }
         }
 
@@ -513,41 +538,94 @@ fn text(buf: &mut [u32], x: usize, y: usize, s: &str, col: u32, scale: usize) ->
     cx
 }
 
-/// Everything on the map that never changes: ocean depth with its coastal highlight,
-/// and unclaimed land by fertility. Computed once, because at 8 pixels a cell a pan
-/// touches 380k pixels and none of this is worth recomputing per frame.
-fn base_colors(fert: &[u8]) -> Vec<u32> {
+/// Nine terrain groups, three near-identical shades each. The variety is the point:
+/// one flat colour per biome reads as a chart, a little per-cell wobble reads as land.
+const BIOMES: [u32; 27] = [
+    0x0A1A2E, 0x0B1B30, 0x091829, // deep water, near identical: water wants to be calm
+    0x102A47, 0x112C4A, 0x0F2844, // open water
+    0x1C4569, 0x1D476C, 0x1A4266, // shallows
+    0xC9B682, 0xD5C48E, 0xBCA876, // sand
+    0x8C9A57, 0x97A660, 0x818E4E, // dry grass
+    0x5E8C42, 0x69984B, 0x54803A, // grass
+    0x33602F, 0x3A6D35, 0x2C5429, // forest
+    0xA9B6AE, 0xB6C2BA, 0x9CAAA2, // tundra
+    0x74706A, 0x807C75, 0x686460, // highland rock
+];
+const BIOME_N: usize = BIOMES.len();
+
+/// Which terrain each cell shows. Fertility carries the elevation, latitude gives
+/// temperature, and a second noise field gives moisture, so the same fertility can be
+/// desert in one place and forest in another. Render only: the simulation still sees
+/// nothing but fertility, and this uses its own rng stream so adding it does not
+/// shift the world's history.
+fn terrain_art(fert: &[u8], seed: u64) -> Vec<u8> {
+    let mut r = Rng(seed ^ 0x5DEE_CE66_D15E_A5E5);
+    let (a, b) = (r.f() * 6.3, r.f() * 6.3);
     (0..W * H)
         .map(|i| {
-            let f = fert[i] as u32;
-            if f < 3 {
-                let base = rgb(9 + f * 3, 24 + f * 8, 44 + f * 14);
-                if neighbours(i % W, i / W).any(|j| fert[j] >= 3) {
-                    shade(base, 1.5)
-                } else {
-                    base
-                }
+            let (x, y) = (i % W, i / W);
+            let f = fert[i];
+            // Hashed, not arithmetic: x*7 + y*13 lays down diagonal stripes, and
+            // structured noise reads as a rendering artefact rather than as ground.
+            let h = (x as u32)
+                .wrapping_mul(0x9E37_79B1)
+                .rotate_left(7)
+                ^ (y as u32).wrapping_mul(0x85EB_CA77);
+            let variant = ((h >> 11) % 3) as usize;
+            let group = if f < 3 {
+                f as usize
             } else {
-                let g = f - 3;
-                rgb(44 + g * 3, 62 + g * 8, 38 + g * 3)
-            }
+                let coast = neighbours(x, y).any(|j| fert[j] < 3);
+                // 0 at the poles, 1 at the equator.
+                let temp = 1.0 - (y as f64 / H as f64 - 0.5).abs() * 2.0;
+                let moist = ((x as f64 * 0.19 + a).sin() * 0.5
+                    + (y as f64 * 0.23 + b).cos() * 0.35
+                    + ((x + y) as f64 * 0.11).sin() * 0.3)
+                    * 0.5
+                    + 0.5;
+                if coast && f <= 4 {
+                    3 // beach
+                } else if temp < 0.28 {
+                    7 // tundra
+                } else if f >= 9 && moist < 0.5 {
+                    8 // bare highland
+                } else if moist > 0.62 || f >= 8 {
+                    6 // forest
+                } else if moist < 0.32 && temp > 0.55 {
+                    4 // dry grass
+                } else {
+                    5 // grass
+                }
+            };
+            (group * 3 + variant) as u8
         })
         .collect()
 }
 
-/// Every civ colour at every fertility, plus the darker edge variant. 12 x 7 entries,
-/// so the inner pixel loop is two array lookups instead of floating point per pixel.
-fn tribe_colors() -> [[(u32, u32); 7]; PAL.len()] {
-    let mut t = [[(0, 0); 7]; PAL.len()];
+/// Owned land keeps its terrain and takes a wash of the civ's colour, the way a map
+/// shades countries. Replacing the terrain outright loses every trace of the land.
+fn tint_tables() -> ([[u32; BIOME_N]; PAL.len()], [u32; PAL.len()]) {
+    let mut tint = [[0u32; BIOME_N]; PAL.len()];
     for (c, &p) in PAL.iter().enumerate() {
-        for f in 0..7 {
-            // Most land sits at the low end of the fertility range, so the floor here
-            // is what sets the overall brightness, not the span.
-            let lit = shade(p, 0.75 + 0.042 * f as f64);
-            t[c][f] = (lit, shade(lit, 0.5));
+        for (t, &b) in BIOMES.iter().enumerate() {
+            // A light wash only. Heavy enough to tell realms apart and the terrain
+            // turns to pastel mush; the borders below are what carry ownership.
+            tint[c][t] = mix(b, p, 0.32);
         }
     }
-    t
+    let mut edge = [0u32; PAL.len()];
+    for (c, &p) in PAL.iter().enumerate() {
+        edge[c] = p; // full strength, so the outline reads against any terrain
+    }
+    (tint, edge)
+}
+
+fn mix(a: u32, b: u32, k: f64) -> u32 {
+    let ch = |sh: u32| {
+        let (x, y) = (((a >> sh) & 0xFF) as f64, ((b >> sh) & 0xFF) as f64);
+        (x + (y - x) * k) as u32
+    };
+    rgb(ch(16), ch(8), ch(0))
 }
 
 /// Fill in map viewport coordinates, clipped to it, so a cell straddling the edge of
@@ -587,22 +665,45 @@ fn render(w: &World, buf: &mut [u32], cam: (i32, i32), zoom: usize) {
         for cx in cx0..=cx1 {
             let i = cy * W + cx;
             let o = w.owner[i] as usize;
-            let (lit, dark) = if o == 0 {
-                (w.base[i], shade(w.base[i], 0.5))
-            } else {
-                w.art[w.tribes[o - 1].col][(w.fert[i] - 3) as usize]
-            };
+            let t = w.terr[i] as usize;
             let (vx, vy) = ((cx * zoom) as i32 - cam.0, (cy * zoom) as i32 - cam.1);
-            vfill(buf, vx, vy, z, z, lit);
-            // A darker edge wherever ownership changes: this is what makes it read as
-            // a map of realms rather than a field of coloured dots.
-            if cx + 1 < W && w.owner[i + 1] as usize != o {
-                vfill(buf, vx + z - 1, vy, 1, z, dark);
+            if o == 0 {
+                vfill(buf, vx, vy, z, z, BIOMES[t]);
+                continue; // wilderness is not a polity, it gets no outline
             }
-            if cy + 1 < H && w.owner[i + W] as usize != o {
-                vfill(buf, vx, vy + z - 1, z, 1, dark);
+            let c = w.tribes[o - 1].col;
+            vfill(buf, vx, vy, z, z, w.tint[c][t]);
+            // Outlined on every side it does not own, in its own colour. Drawing only
+            // the right and bottom edges leaves a realm's left and top drawn by the
+            // neighbour instead, so no realm ends up with a coherent outline.
+            let (line, bw) = (w.edge[c], (z / 5).max(2));
+            let diff = |j: usize| w.owner[j] as usize != o;
+            if cx + 1 == W || diff(i + 1) {
+                vfill(buf, vx + z - bw, vy, bw, z, line);
+            }
+            if cx == 0 || diff(i - 1) {
+                vfill(buf, vx, vy, bw, z, line);
+            }
+            if cy + 1 == H || diff(i + W) {
+                vfill(buf, vx, vy + z - bw, z, bw, line);
+            }
+            if cy == 0 || diff(i - W) {
+                vfill(buf, vx, vy, z, bw, line);
             }
         }
+    }
+
+    // Cities, drawn over the borders so a capital on a frontier still reads.
+    for t in w.tribes.iter().filter(|t| t.alive) {
+        let (cx, cy) = (t.seat as usize % W, t.seat as usize / W);
+        if cx < cx0 || cx > cx1 || cy < cy0 || cy > cy1 {
+            continue;
+        }
+        let s = (z / 3).max(3);
+        let vx = (cx * zoom) as i32 - cam.0 + (z - s) / 2;
+        let vy = (cy * zoom) as i32 - cam.1 + (z - s) / 2;
+        vfill(buf, vx - 1, vy - 1, s + 2, s + 2, 0x2A211A);
+        vfill(buf, vx, vy, s, s, mix(PAL[t.col], 0xFFF3D6, 0.75));
     }
 
     // Panel: who is who, biggest first.

@@ -16,6 +16,10 @@ Peoples grow, discover, spread along their coasts, fight over borders, split apa
 they get too big, and die. You watch. Close it, come back tomorrow, and the world has
 moved on without you.
 
+The map is terrain first — water depth, beaches, grass, forest, dry plains, tundra at the
+poles, bare highland — with each realm as a light wash over the land it holds plus an
+outline in its own colour, and a marker where its city sits.
+
 ```
 cargo run --release
 ```
@@ -42,7 +46,7 @@ factor only, so a resized window puts every click in the wrong place.
 
 ## speed
 
-Measured, not guessed: a simulated year costs **10 µs**, a full redraw **277 µs** — 1.7%
+Measured, not guessed: a simulated year costs **11 µs**, a full redraw **313 µs** — 1.9%
 of one 60fps frame, for a picture that changes five times a second. Sitting there
 watching costs **0.4% of one core** and 12 MB.
 
